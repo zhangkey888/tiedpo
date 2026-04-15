@@ -1,0 +1,21 @@
+[
+  {
+    "prompt": "What activities did the family enjoy during their 4th of July celebration?",
+    "chosen": "Based on the images, the family enjoyed a variety of traditional 4th of July activities. They gathered around a campfire which provided warmth and light in the evening. The children played with sparklers, creating beautiful light trails in the darkness.",
+    "rejected": "The 4th of July celebration featured several nighttime activities centered around light and fire. Most prominently, there was a bonfire where family members gathered, creating a cozy atmosphere.",
+    "is_tie": true,
+    "images": [
+      "images/sample_0.png",
+      "images/sample_1.png"
+    ]
+  },
+  {
+    "prompt": "Describe what is happening in the scene.",
+    "chosen": "The image shows a detailed and accurate description of the scene with specific visual elements clearly identified.",
+    "rejected": "The image shows a vague and incomplete description that misses key visual elements present in the scene.",
+    "is_tie": false,
+    "images": [
+      "images/sample_2.png"
+    ]
+  }
+]
