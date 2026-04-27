@@ -582,8 +582,8 @@ class TieDPOTrainer(Trainer):
         chosen_rewards = self.beta * (policy_chosen_logps.to(self.accelerator.device) - reference_chosen_logps.to(self.accelerator.device)).detach()
         rejected_rewards = self.beta * (policy_rejected_logps.to(self.accelerator.device) - reference_rejected_logps.to(self.accelerator.device)).detach()
 
-        strict_loss = losses[strict_mask].mean() if strict_mask.any() else torch.tensor(0.0, device=self.accelerator.device)
-        tie_loss = losses[tie_mask].mean() if tie_mask.any() else torch.tensor(0.0, device=self.accelerator.device)
+        strict_loss = losses[strict_mask].sum() if strict_mask.any() else torch.tensor(0.0, device=self.accelerator.device)
+        tie_loss = losses[tie_mask].sum() if tie_mask.any() else torch.tensor(0.0, device=self.accelerator.device)
 
         return strict_loss, tie_loss, chosen_rewards, rejected_rewards
 
@@ -706,13 +706,29 @@ class TieDPOTrainer(Trainer):
             is_tie,
         )
 
-        dpo_loss = self.dpo_alpha * strict_loss
-        tie_reg_loss = self.lambda_tie * tie_loss
-        sft_loss = self.gamma * self.get_sft_loss(policy_chosen_logits, chosen_labels)
+        strict_mask = ~is_tie
+        tie_mask = is_tie
+        batch_size = policy_chosen_logps.shape[0]
+
+        dpo_loss = self.dpo_alpha * strict_loss / batch_size
+        tie_reg_loss = self.lambda_tie * tie_loss / batch_size
+
+        sft_loss = torch.tensor(0.0, device=self.accelerator.device)
+        if strict_mask.any():
+            sft_loss = sft_loss + self.get_sft_loss(
+                policy_chosen_logits[strict_mask], chosen_labels[strict_mask]
+            )
+        if tie_mask.any():
+            sft_chosen_loss = self.get_sft_loss(
+                policy_chosen_logits[tie_mask], chosen_labels[tie_mask]
+            )
+            sft_rejected_loss = self.get_sft_loss(
+                policy_rejected_logits[tie_mask], rejected_labels[tie_mask]
+            )
+            sft_loss = sft_loss + 0.5 * (sft_chosen_loss + sft_rejected_loss)
+        sft_loss = self.gamma * sft_loss
 
         losses = dpo_loss + tie_reg_loss + sft_loss
-
-        reward_accuracies = (chosen_rewards > rejected_rewards).float()
 
         def all_gather_tensor(tensor):
             if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -724,25 +740,37 @@ class TieDPOTrainer(Trainer):
 
         chosen_rewards = all_gather_tensor(chosen_rewards)
         rejected_rewards = all_gather_tensor(rejected_rewards)
-        reward_accuracies = all_gather_tensor(reward_accuracies)
+        is_tie_gathered = all_gather_tensor(is_tie.float())
+        strict_mask_gathered = is_tie_gathered < 0.5
+        tie_mask_gathered = is_tie_gathered > 0.5
         policy_chosen_logps = all_gather_tensor(policy_chosen_logps)
         policy_rejected_logps = all_gather_tensor(policy_rejected_logps)
         reference_chosen_logps = all_gather_tensor(reference_chosen_logps)
         reference_rejected_logps = all_gather_tensor(reference_rejected_logps)
 
         prefix = "eval_" if train_eval == "eval" else ""
-        metrics[f"{prefix}losses/strict_dpo"] = strict_loss.cpu()
-        metrics[f"{prefix}losses/tie_reg"] = tie_loss.cpu()
+        metrics[f"{prefix}losses/strict_dpo"] = strict_loss.cpu() / batch_size
+        metrics[f"{prefix}losses/tie_reg"] = tie_loss.cpu() / batch_size
         metrics[f"{prefix}losses/sft"] = sft_loss.detach().cpu()
         metrics[f"{prefix}losses/total"] = losses.detach().cpu()
         metrics[f"{prefix}rewards/chosen"] = chosen_rewards.mean().cpu()
         metrics[f"{prefix}rewards/rejected"] = rejected_rewards.mean().cpu()
-        metrics[f"{prefix}rewards/accuracies"] = reward_accuracies.mean().cpu()
         metrics[f"{prefix}rewards/margins"] = (chosen_rewards - rejected_rewards).mean().cpu()
         metrics[f"{prefix}logps/chosen"] = policy_chosen_logps.detach().mean().cpu()
         metrics[f"{prefix}logps/rejected"] = policy_rejected_logps.detach().mean().cpu()
         metrics[f"{prefix}ref_logps/chosen"] = reference_chosen_logps.mean().cpu()
         metrics[f"{prefix}ref_logps/rejected"] = reference_rejected_logps.mean().cpu()
+
+        if strict_mask_gathered.any():
+            metrics[f"{prefix}rewards/strict_accuracy"] = (
+                (chosen_rewards[strict_mask_gathered] > rejected_rewards[strict_mask_gathered]).float().mean().cpu()
+            )
+            metrics[f"{prefix}rewards/strict_margin"] = (
+                (chosen_rewards[strict_mask_gathered] - rejected_rewards[strict_mask_gathered]).mean().cpu()
+            )
+        if tie_mask_gathered.any():
+            tie_reward_l1 = (chosen_rewards[tie_mask_gathered] - rejected_rewards[tie_mask_gathered]).abs().mean().cpu()
+            metrics[f"{prefix}rewards/tie_reward_l1"] = tie_reward_l1
 
         n_tie = is_tie.sum().item()
         n_strict = (~is_tie).sum().item()
