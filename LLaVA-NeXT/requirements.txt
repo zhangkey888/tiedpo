@@ -16,7 +16,7 @@ deepspeed==0.18.8
 
 # Local trl (VDPOTrainer / SVCOTrainer / TieDPOTrainer live under trl/ in this repo)
 # The system trl package is NOT used; install tyro which is a dependency of local trl
-tyro==1.0.12
+tyro==1.0.10
 
 # Vision
 Pillow==11.3.0

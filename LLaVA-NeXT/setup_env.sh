@@ -4,11 +4,12 @@
 # Usage: bash setup_env.sh [conda_env_name]
 #
 # After running this script, train with:
-#   cd LLaVA-NeXT && bash scripts/train/TieDPO.sh
+#   cd LLaVA-NeXT && bash scripts/train/run_lora_c1_minimal.sh
 
 set -e
-
+export PYTHONNOUSERSITE=1
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH:-}"
 
 echo "[1/3] Installing Python dependencies..."
 pip install -r "${SCRIPT_DIR}/requirements.txt"
@@ -47,4 +48,4 @@ print('OK: all imports successful')
 
 echo ""
 echo "Setup complete. Run training with:"
-echo "  cd ${SCRIPT_DIR} && bash scripts/train/TieDPO.sh"
+echo "  cd ${SCRIPT_DIR} && bash scripts/train/run_lora_c1_minimal.sh"

@@ -192,6 +192,8 @@ class LlavaMetaForCausalLM(ABC):
     def encode_images(self, images):
         image_features = self.get_model().get_vision_tower()(images)
         # image_features = self.get_model().vision_resampler(image_features, images=images)
+        projector_dtype = next(self.get_model().mm_projector.parameters()).dtype
+        image_features = image_features.to(dtype=projector_dtype)
         image_features = self.get_model().mm_projector(image_features)
         return image_features
     
@@ -203,7 +205,8 @@ class LlavaMetaForCausalLM(ABC):
         cur_mm_spatial_pool_stride = self.config.mm_spatial_pool_stride
 
         for idx, feat in enumerate(per_videos_or_images_features):
-            
+            projector_dtype = next(self.get_model().mm_projector.parameters()).dtype
+            feat = feat.to(dtype=projector_dtype)
             feat = self.get_model().mm_projector(feat)
             faster_video_feature = 0
             slower_img_feat = 0

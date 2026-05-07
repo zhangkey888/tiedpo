@@ -14,7 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import inspect
+import json
 import random
+import urllib.request
 import warnings
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
@@ -63,6 +65,37 @@ if is_deepspeed_available():
     import deepspeed
 
 from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
+
+
+def _emit_nccl_debug_event(run_id: str, hypothesis_id: str, location: str, msg: str, data: Optional[Dict[str, Any]] = None):
+    # #region debug-point A:nccl-collective
+    _p = ".dbg/nccl-collective-timeout.env"
+    _u, _s = "http://127.0.0.1:7777/event", "nccl-collective-timeout"
+    try:
+        with open(_p) as f:
+            c = f.read()
+        _u = next((l.split("=", 1)[1] for l in c.split("\n") if l.startswith("DEBUG_SERVER_URL=")), _u)
+        _s = next((l.split("=", 1)[1] for l in c.split("\n") if l.startswith("DEBUG_SESSION_ID=")), _s)
+        urllib.request.urlopen(
+            urllib.request.Request(
+                _u,
+                data=json.dumps(
+                    {
+                        "sessionId": _s,
+                        "runId": run_id,
+                        "hypothesisId": hypothesis_id,
+                        "location": location,
+                        "msg": msg,
+                        "data": data or {},
+                    }
+                ).encode(),
+                headers={"Content-Type": "application/json"},
+            ),
+            timeout=0.2,
+        ).read()
+    except Exception:
+        pass
+    # #endregion
 
 
 class TieDPODataCollatorWithPadding:
@@ -162,6 +195,7 @@ class TieDPOTrainer(Trainer):
         dpo_alpha: float = 1.0,
         beta: float = 0.1,
         gamma: float = 0.1,
+        sft_loss_mode: Literal["strict_only", "tie_symmetric"] = "tie_symmetric",
         lambda_tie: float = 1.0,
         tie_margin: float = 0.0,
         label_smoothing: float = 0,
@@ -235,7 +269,16 @@ class TieDPOTrainer(Trainer):
             self.ref_model = None
         else:
             if is_deepspeed_zero3_enabled():
-                self.ref_model = AutoModelForCausalLM.from_pretrained(model)
+                ref_model_name_or_path = getattr(model, "name_or_path", None) or getattr(model.config, "_name_or_path", None)
+                if not ref_model_name_or_path:
+                    raise ValueError(
+                        "DeepSpeed ZeRO-3 requires a reloadable base model path for the reference model, "
+                        "but none was found on `model.name_or_path` or `model.config._name_or_path`."
+                    )
+                try:
+                    self.ref_model = model.__class__.from_pretrained(ref_model_name_or_path)
+                except Exception:
+                    self.ref_model = AutoModelForCausalLM.from_pretrained(ref_model_name_or_path)
             else:
                 self.ref_model = create_reference_model(model)
 
@@ -290,6 +333,7 @@ class TieDPOTrainer(Trainer):
         self.dpo_alpha = dpo_alpha
         self.beta = beta
         self.gamma = gamma
+        self.sft_loss_mode = sft_loss_mode
         self.lambda_tie = lambda_tie
         self.tie_margin = tie_margin
         self.label_smoothing = label_smoothing
@@ -582,8 +626,9 @@ class TieDPOTrainer(Trainer):
         chosen_rewards = self.beta * (policy_chosen_logps.to(self.accelerator.device) - reference_chosen_logps.to(self.accelerator.device)).detach()
         rejected_rewards = self.beta * (policy_rejected_logps.to(self.accelerator.device) - reference_rejected_logps.to(self.accelerator.device)).detach()
 
-        strict_loss = losses[strict_mask].mean() if strict_mask.any() else torch.tensor(0.0, device=self.accelerator.device)
-        tie_loss = losses[tie_mask].mean() if tie_mask.any() else torch.tensor(0.0, device=self.accelerator.device)
+        # Return SUM losses; caller decides normalization to avoid batch-composition sensitivity.
+        strict_loss = losses[strict_mask].sum() if strict_mask.any() else torch.tensor(0.0, device=self.accelerator.device)
+        tie_loss = losses[tie_mask].sum() if tie_mask.any() else torch.tensor(0.0, device=self.accelerator.device)
 
         return strict_loss, tie_loss, chosen_rewards, rejected_rewards
 
@@ -697,6 +742,32 @@ class TieDPOTrainer(Trainer):
         is_tie = batch.get("is_tie", torch.zeros(policy_chosen_logps.shape[0], dtype=torch.bool))
         if isinstance(is_tie, list):
             is_tie = torch.tensor(is_tie, dtype=torch.bool)
+        is_tie = is_tie.to(self.accelerator.device).bool()
+        strict_mask = ~is_tie
+        tie_mask = is_tie
+
+        is_ep_tie = batch.get("is_ep_tie", torch.zeros(policy_chosen_logps.shape[0], dtype=torch.bool))
+        if isinstance(is_ep_tie, list):
+            is_ep_tie = torch.tensor(is_ep_tie, dtype=torch.bool)
+        is_ep_tie = is_ep_tie.to(self.accelerator.device).bool()
+        rank = torch.distributed.get_rank() if torch.distributed.is_available() and torch.distributed.is_initialized() else -1
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_available() and torch.distributed.is_initialized() else 1
+        step = getattr(getattr(self, "state", None), "global_step", -1)
+        _emit_nccl_debug_event(
+            "pre-fix",
+            "A",
+            "tie_dpo_trainer.py:get_batch_loss_metrics:enter",
+            "[DEBUG] enter get_batch_loss_metrics",
+            {
+                "rank": rank,
+                "world_size": world_size,
+                "train_eval": train_eval,
+                "step": step,
+                "local_batch_size": int(policy_chosen_logps.shape[0]),
+                "n_tie_local": int(is_tie.sum().item()),
+                "n_ep_tie_local": int(is_ep_tie.sum().item()),
+            },
+        )
 
         strict_loss, tie_loss, chosen_rewards, rejected_rewards = self.tie_dpo_loss(
             policy_chosen_logps,
@@ -706,48 +777,110 @@ class TieDPOTrainer(Trainer):
             is_tie,
         )
 
-        dpo_loss = self.dpo_alpha * strict_loss
-        tie_reg_loss = self.lambda_tie * tie_loss
-        sft_loss = self.gamma * self.get_sft_loss(policy_chosen_logits, chosen_labels)
+        batch_size = policy_chosen_logps.shape[0]
+        dpo_loss = self.dpo_alpha * strict_loss / batch_size
+        tie_reg_loss = self.lambda_tie * tie_loss / batch_size
+
+        sft_strict = torch.tensor(0.0, device=self.accelerator.device)
+        sft_tie = torch.tensor(0.0, device=self.accelerator.device)
+        if strict_mask.any():
+            sft_strict = self.get_sft_loss(policy_chosen_logits[strict_mask], chosen_labels[strict_mask])
+        if tie_mask.any():
+            if self.sft_loss_mode == "tie_symmetric":
+                sft_tie_chosen = self.get_sft_loss(policy_chosen_logits[tie_mask], chosen_labels[tie_mask])
+                sft_tie_rejected = self.get_sft_loss(policy_rejected_logits[tie_mask], rejected_labels[tie_mask])
+                sft_tie = 0.5 * (sft_tie_chosen + sft_tie_rejected)
+            elif self.sft_loss_mode == "strict_only":
+                sft_tie = torch.tensor(0.0, device=self.accelerator.device)
+            else:
+                raise ValueError(f"Unsupported sft_loss_mode: {self.sft_loss_mode}")
+        sft_loss = self.gamma * (sft_strict + sft_tie)
 
         losses = dpo_loss + tie_reg_loss + sft_loss
 
         reward_accuracies = (chosen_rewards > rejected_rewards).float()
+        margins = chosen_rewards - rejected_rewards
+        abs_margins = margins.abs()
 
-        def all_gather_tensor(tensor):
+        def reduce_sum_scalar(value):
+            if isinstance(value, torch.Tensor):
+                reduced = value.detach().to(self.accelerator.device, dtype=torch.float32)
+            else:
+                reduced = torch.tensor(float(value), device=self.accelerator.device, dtype=torch.float32)
             if torch.distributed.is_available() and torch.distributed.is_initialized():
-                tensor = tensor.detach()
-                gathered_tensor = [torch.zeros_like(tensor) for _ in range(torch.distributed.get_world_size())]
-                torch.distributed.all_gather(gathered_tensor, tensor)
-                tensor = torch.cat(gathered_tensor, dim=0)
-            return tensor
+                torch.distributed.all_reduce(reduced, op=torch.distributed.ReduceOp.SUM)
+            return reduced
 
-        chosen_rewards = all_gather_tensor(chosen_rewards)
-        rejected_rewards = all_gather_tensor(rejected_rewards)
-        reward_accuracies = all_gather_tensor(reward_accuracies)
-        policy_chosen_logps = all_gather_tensor(policy_chosen_logps)
-        policy_rejected_logps = all_gather_tensor(policy_rejected_logps)
-        reference_chosen_logps = all_gather_tensor(reference_chosen_logps)
-        reference_rejected_logps = all_gather_tensor(reference_rejected_logps)
+        def reduce_mean_scalar(numerator, denominator):
+            numerator_sum = reduce_sum_scalar(numerator)
+            denominator_sum = reduce_sum_scalar(denominator)
+            return float((numerator_sum / denominator_sum.clamp_min(1.0)).item())
 
         prefix = "eval_" if train_eval == "eval" else ""
-        metrics[f"{prefix}losses/strict_dpo"] = strict_loss.cpu()
-        metrics[f"{prefix}losses/tie_reg"] = tie_loss.cpu()
-        metrics[f"{prefix}losses/sft"] = sft_loss.detach().cpu()
-        metrics[f"{prefix}losses/total"] = losses.detach().cpu()
-        metrics[f"{prefix}rewards/chosen"] = chosen_rewards.mean().cpu()
-        metrics[f"{prefix}rewards/rejected"] = rejected_rewards.mean().cpu()
-        metrics[f"{prefix}rewards/accuracies"] = reward_accuracies.mean().cpu()
-        metrics[f"{prefix}rewards/margins"] = (chosen_rewards - rejected_rewards).mean().cpu()
-        metrics[f"{prefix}logps/chosen"] = policy_chosen_logps.detach().mean().cpu()
-        metrics[f"{prefix}logps/rejected"] = policy_rejected_logps.detach().mean().cpu()
-        metrics[f"{prefix}ref_logps/chosen"] = reference_chosen_logps.mean().cpu()
-        metrics[f"{prefix}ref_logps/rejected"] = reference_rejected_logps.mean().cpu()
+        total_count = float(policy_chosen_logps.shape[0])
+        n_strict = float(strict_mask.sum().item())
+        n_tie = float(tie_mask.sum().item())
+        n_ep_tie = float(is_ep_tie.sum().item())
 
-        n_tie = is_tie.sum().item()
-        n_strict = (~is_tie).sum().item()
-        metrics[f"{prefix}data/n_tie"] = float(n_tie)
-        metrics[f"{prefix}data/n_strict"] = float(n_strict)
+        metrics[f"{prefix}losses/strict_dpo"] = reduce_mean_scalar(strict_loss, n_strict)
+        metrics[f"{prefix}losses/tie_reg"] = reduce_mean_scalar(tie_loss, n_tie)
+        metrics[f"{prefix}losses/sft"] = reduce_mean_scalar(sft_loss.detach(), 1.0)
+        metrics[f"{prefix}losses/sft_strict"] = reduce_mean_scalar((self.gamma * sft_strict).detach(), 1.0)
+        metrics[f"{prefix}losses/sft_tie"] = reduce_mean_scalar((self.gamma * sft_tie).detach(), 1.0)
+        metrics[f"{prefix}losses/total"] = reduce_mean_scalar(losses.detach(), 1.0)
+        metrics[f"{prefix}rewards/chosen"] = reduce_mean_scalar(chosen_rewards.sum(), total_count)
+        metrics[f"{prefix}rewards/rejected"] = reduce_mean_scalar(rejected_rewards.sum(), total_count)
+        metrics[f"{prefix}rewards/accuracies"] = reduce_mean_scalar(reward_accuracies.sum(), total_count)
+        metrics[f"{prefix}rewards/pooled_accuracy"] = reduce_mean_scalar(reward_accuracies.sum(), total_count)
+        metrics[f"{prefix}rewards/margins"] = reduce_mean_scalar(margins.sum(), total_count)
+        metrics[f"{prefix}logps/chosen"] = reduce_mean_scalar(policy_chosen_logps.sum(), total_count)
+        metrics[f"{prefix}logps/rejected"] = reduce_mean_scalar(policy_rejected_logps.sum(), total_count)
+        metrics[f"{prefix}ref_logps/chosen"] = reduce_mean_scalar(reference_chosen_logps.sum(), total_count)
+        metrics[f"{prefix}ref_logps/rejected"] = reduce_mean_scalar(reference_rejected_logps.sum(), total_count)
+
+        strict_accuracy_num = reward_accuracies[strict_mask].sum() if strict_mask.any() else 0.0
+        strict_margin_num = margins[strict_mask].sum() if strict_mask.any() else 0.0
+        tie_reward_l1_num = abs_margins[tie_mask].sum() if tie_mask.any() else 0.0
+        tie_chosen_num = chosen_rewards[tie_mask].sum() if tie_mask.any() else 0.0
+        tie_rejected_num = rejected_rewards[tie_mask].sum() if tie_mask.any() else 0.0
+        metrics[f"{prefix}rewards/strict_accuracy"] = reduce_mean_scalar(strict_accuracy_num, n_strict)
+        metrics[f"{prefix}rewards/strict_margin"] = reduce_mean_scalar(strict_margin_num, n_strict)
+        metrics[f"{prefix}rewards/tie_reward_l1"] = reduce_mean_scalar(tie_reward_l1_num, n_tie)
+        metrics[f"{prefix}rewards/tie_chosen"] = reduce_mean_scalar(tie_chosen_num, n_tie)
+        metrics[f"{prefix}rewards/tie_rejected"] = reduce_mean_scalar(tie_rejected_num, n_tie)
+
+        tie_threshold = float(self.tie_margin) if self.tie_margin is not None else 0.0
+        tie_acc_num = (abs_margins[tie_mask] <= max(tie_threshold, 1e-6)).float().sum() if tie_mask.any() else 0.0
+        strict_acc_num = (margins[strict_mask] > 0).float().sum() if strict_mask.any() else 0.0
+        ep_tie_acc_num = (abs_margins[is_ep_tie] <= max(tie_threshold, 1e-6)).float().sum() if is_ep_tie.any() else 0.0
+        ep_tie_margin_num = abs_margins[is_ep_tie].sum() if is_ep_tie.any() else 0.0
+        strict_margin_global = reduce_mean_scalar(strict_margin_num, n_strict)
+        tie_margin_global = reduce_mean_scalar(tie_reward_l1_num, n_tie)
+        metrics[f"{prefix}tiebench/TieAcc"] = reduce_mean_scalar(tie_acc_num, n_tie)
+        metrics[f"{prefix}tiebench/TieMargin"] = tie_margin_global
+        metrics[f"{prefix}tiebench/StrictAcc"] = reduce_mean_scalar(strict_acc_num, n_strict)
+        metrics[f"{prefix}tiebench/StrictMargin"] = strict_margin_global
+        metrics[f"{prefix}tiebench/CalibGap"] = strict_margin_global - tie_margin_global
+        metrics[f"{prefix}tiebench/EPTieAcc"] = reduce_mean_scalar(ep_tie_acc_num, n_ep_tie)
+        metrics[f"{prefix}tiebench/EPTieMargin"] = reduce_mean_scalar(ep_tie_margin_num, n_ep_tie)
+
+        metrics[f"{prefix}data/n_tie"] = float(reduce_sum_scalar(n_tie).item())
+        metrics[f"{prefix}data/n_strict"] = float(reduce_sum_scalar(n_strict).item())
+        metrics[f"{prefix}data/n_ep_tie"] = float(reduce_sum_scalar(n_ep_tie).item())
+        _emit_nccl_debug_event(
+            "pre-fix",
+            "A",
+            "tie_dpo_trainer.py:get_batch_loss_metrics:exit",
+            "[DEBUG] exit get_batch_loss_metrics",
+            {
+                "rank": rank,
+                "train_eval": train_eval,
+                "step": step,
+                "n_tie_global": metrics[f"{prefix}data/n_tie"],
+                "n_strict_global": metrics[f"{prefix}data/n_strict"],
+                "n_ep_tie_global": metrics[f"{prefix}data/n_ep_tie"],
+            },
+        )
 
         return losses, metrics
 
@@ -796,7 +929,7 @@ class TieDPOTrainer(Trainer):
 
     def store_metrics(self, metrics: Dict[str, float], train_eval: Literal["train", "eval"] = "train") -> None:
         for key, value in metrics.items():
-            self._stored_metrics[train_eval][key].append(value)
+            self._stored_metrics[train_eval][key].append(float(value))
 
     def evaluation_loop(
         self,
@@ -812,7 +945,7 @@ class TieDPOTrainer(Trainer):
     def log(self, logs: Dict[str, float], start_time: Optional[float] = None) -> None:
         train_eval = "train" if "loss" in logs else "eval"
         for key, metrics in self._stored_metrics[train_eval].items():
-            logs[key] = torch.tensor(metrics).mean().item()
+            logs[key] = sum(metrics) / len(metrics)
         del self._stored_metrics[train_eval]
         if start_time is not None:
             return super().log(logs, start_time)

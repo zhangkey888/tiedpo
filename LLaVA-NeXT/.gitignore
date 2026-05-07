@@ -12,6 +12,7 @@ ckpt/
 *.safetensors
 *.pt
 *.pth
+*.png
 
 # Logs
 wandb/

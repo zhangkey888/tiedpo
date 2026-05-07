@@ -23,6 +23,8 @@ import logging
 import pathlib
 from typing import Dict, Optional, Sequence, List
 import ast
+import urllib.request
+import urllib.error
 
 import yaml
 import time
@@ -55,6 +57,7 @@ from decord import VideoReader, cpu
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 from packaging import version
 from typing import Any
+from torch.distributed.elastic.multiprocessing.errors import record
 
 local_rank = None
 import numpy as np
@@ -114,6 +117,7 @@ class ModelArguments:
 @dataclass
 class DataArguments:
     data_path: str = field(default=None, metadata={"help": "Path to the training data json/jsonl."})
+    eval_data_path: Optional[str] = field(default=None, metadata={"help": "Path to the eval data json/jsonl."})
     lazy_preprocess: bool = False
     is_multimodal: bool = False
     image_folder: Optional[str] = field(default=None)
@@ -160,8 +164,11 @@ class TrainingArguments(transformers.TrainingArguments):
     dpo_alpha: float = field(default=1.0)
     beta: float = field(default=0.1)
     gamma: float = field(default=0.1)
+    sft_loss_mode: str = field(default="tie_symmetric")
     lambda_tie: float = field(default=1.0)
     tie_margin: float = field(default=0.0)
+    max_prompt_length: Optional[int] = field(default=None)
+    eval_only: bool = field(default=False)
     generate_during_eval: bool = field(default=False)
     precompute_ref_log_probs: bool = field(default=False)
 
@@ -333,6 +340,61 @@ def load_data(data_path):
     return load_json(data_path)
 
 
+def safe_emit_debug_event(payload, env_path=".dbg/tie-dpo-child-failure.env"):
+    debug_url = "http://127.0.0.1:7777/event"
+    session_id = "tie-dpo-child-failure"
+    try:
+        with open(env_path) as f:
+            content = f.read()
+        debug_url = next((line.split("=", 1)[1] for line in content.split("\n") if line.startswith("DEBUG_SERVER_URL=")), debug_url)
+        session_id = next((line.split("=", 1)[1] for line in content.split("\n") if line.startswith("DEBUG_SESSION_ID=")), session_id)
+    except Exception:
+        pass
+
+    payload = dict(payload)
+    payload.setdefault("sessionId", session_id)
+    try:
+        req = urllib.request.Request(
+            debug_url,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(req, timeout=1).read()
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        pass
+
+
+def get_last_resumable_checkpoint(output_dir: str):
+    if not output_dir or not os.path.isdir(output_dir):
+        return None, None
+
+    last_ckpt = transformers.trainer_utils.get_last_checkpoint(output_dir)
+    if last_ckpt is None:
+        return None, None
+
+    trainer_state_name = transformers.trainer.TRAINER_STATE_NAME
+    trainer_state_path = os.path.join(last_ckpt, trainer_state_name)
+    if os.path.exists(trainer_state_path):
+        return last_ckpt, trainer_state_path
+
+    ckpt_pattern = re.compile(r"^checkpoint-(\d+)$")
+    valid_ckpts = []
+    for name in os.listdir(output_dir):
+        full_path = os.path.join(output_dir, name)
+        match = ckpt_pattern.fullmatch(name)
+        if match and os.path.isdir(full_path):
+            state_path = os.path.join(full_path, trainer_state_name)
+            if os.path.exists(state_path):
+                valid_ckpts.append((int(match.group(1)), full_path, state_path))
+
+    if valid_ckpts:
+        valid_ckpts.sort()
+        _, ckpt_path, state_path = valid_ckpts[-1]
+        return ckpt_path, state_path
+
+    return None, trainer_state_path
+
+
 def expand2square(pil_img, background_color):
     width, height = pil_img.size
     if width == height:
@@ -418,12 +480,82 @@ class TieDPODataset(Dataset):
     def __len__(self):
         return len(self.list_data_dict)
 
+    def _get_prompt(self, sample):
+        return sample.get("prompt") or sample.get("question") or sample.get("statement", "")
+
+    def _get_pair_texts_and_label(self, sample):
+        if "chosen" in sample and "rejected" in sample:
+            chosen_text = sample["chosen"]
+            rejected_text = sample["rejected"]
+            label = sample.get("label", "better_a")
+        else:
+            chosen_text = sample.get("response_a")
+            rejected_text = sample.get("response_b")
+            preference = sample.get("preference")
+            if preference == "response_b":
+                label = "better_b"
+            elif preference == "tie":
+                label = "tie"
+            else:
+                label = "better_a"
+
+        if chosen_text is None or rejected_text is None:
+            raise KeyError("Each TieDPO sample must provide chosen/rejected or response_a/response_b.")
+
+        if "is_tie" in sample:
+            is_tie = bool(sample["is_tie"])
+            if is_tie:
+                label = "tie"
+        else:
+            is_tie = (label == "tie")
+
+        if label == "better_b":
+            chosen_text, rejected_text = rejected_text, chosen_text
+            is_tie = False
+
+        return chosen_text, rejected_text, label, is_tie
+
+    def _get_extra_flags(self, sample):
+        metadata = sample.get("metadata", {}) if isinstance(sample.get("metadata"), dict) else {}
+        source = sample.get("source", "")
+        tie_type = metadata.get("tie_type") or sample.get("tie_type")
+        is_tie = bool(sample.get("is_tie", sample.get("label") == "tie" or sample.get("preference") == "tie"))
+        is_ep_tie = is_tie and (
+            source == "nextqa"
+            or tie_type == "evidence_path"
+            or sample.get("task_type") == "pathA_pathB"
+        )
+        return {
+            "is_ep_tie": is_ep_tie,
+        }
+
+    def _has_image(self, sample):
+        return any(k in sample for k in ("image", "images", "image_paths_relative", "image_paths_absolute", "video"))
+
+    def _get_image_files(self, sample):
+        if "image_paths_absolute" in sample:
+            image_file = sample["image_paths_absolute"]
+        elif "image_paths_relative" in sample:
+            image_file = sample["image_paths_relative"]
+        elif "image" in sample:
+            image_file = sample["image"]
+        elif "images" in sample:
+            image_file = sample["images"]
+        else:
+            return None
+
+        if isinstance(image_file, list):
+            return image_file
+        return [image_file]
+
     @property
     def lengths(self):
         length_list = []
         for sample in self.list_data_dict:
-            cur_len = len(sample["prompt"].split()) + len(sample["chosen"].split()) + len(sample["rejected"].split())
-            img_tokens = 128 if "image" in sample else 0
+            prompt = self._get_prompt(sample)
+            chosen_text, rejected_text, _, _ = self._get_pair_texts_and_label(sample)
+            cur_len = len(prompt.split()) + len(chosen_text.split()) + len(rejected_text.split())
+            img_tokens = 128 if self._has_image(sample) else 0
             length_list.append(cur_len + img_tokens)
         return length_list
 
@@ -431,18 +563,21 @@ class TieDPODataset(Dataset):
     def modality_lengths(self):
         length_list = []
         for sample in self.list_data_dict:
-            cur_len = len(sample["prompt"].split()) + len(sample["chosen"].split()) + len(sample["rejected"].split())
-            cur_len = cur_len if ("video" in sample or "image" in sample) else -cur_len
+            prompt = self._get_prompt(sample)
+            chosen_text, rejected_text, _, _ = self._get_pair_texts_and_label(sample)
+            cur_len = len(prompt.split()) + len(chosen_text.split()) + len(rejected_text.split())
+            cur_len = cur_len if self._has_image(sample) else -cur_len
             length_list.append(cur_len)
         return length_list
 
     def process_image(self, image_file):
         image_folder = self.data_args.image_folder
         processor = self.data_args.image_processor
+        image_path = image_file if os.path.isabs(image_file) else os.path.join(image_folder, image_file)
         try:
-            image = Image.open(os.path.join(image_folder, image_file)).convert("RGB")
+            image = Image.open(image_path).convert("RGB")
         except Exception as exn:
-            print(f"Failed to open image {image_file}. Exception:", exn)
+            print(f"Failed to open image {image_path}. Exception:", exn)
             raise exn
 
         image_size = image.size
@@ -462,20 +597,7 @@ class TieDPODataset(Dataset):
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
         sources = self.list_data_dict[i]
-
-        if "is_tie" in sources:
-            is_tie = bool(sources["is_tie"])
-            label = "tie" if is_tie else "better_a"
-        else:
-            label = sources.get("label", "better_a")
-            is_tie = (label == "tie")
-
-        chosen_text = sources["chosen"]
-        rejected_text = sources["rejected"]
-
-        if label == "better_b":
-            chosen_text, rejected_text = rejected_text, chosen_text
-            is_tie = False
+        chosen_text, rejected_text, label, is_tie = self._get_pair_texts_and_label(sources)
 
         if isinstance(i, int):
             sources_list = [self.list_data_dict[i]]
@@ -484,12 +606,9 @@ class TieDPODataset(Dataset):
 
         assert len(sources_list) == 1
 
-        if "image" in sources_list[0]:
-            image_file = self.list_data_dict[i]["image"]
-            if type(image_file) is list:
-                image = [self.process_image(f) for f in image_file]
-            else:
-                image = [self.process_image(image_file)]
+        image_files = self._get_image_files(self.list_data_dict[i])
+        if image_files is not None:
+            image = [self.process_image(f) for f in image_files]
         elif "video" in sources_list[0]:
             video_file = self.list_data_dict[i]["video"]
             video_folder = self.data_args.video_folder
@@ -511,7 +630,7 @@ class TieDPODataset(Dataset):
             image = None
 
         data_dict = copy.deepcopy(self.list_data_dict[i])
-        prompt = data_dict.get("prompt", "")
+        prompt = self._get_prompt(data_dict)
 
         source = {
             "image": image,
@@ -520,7 +639,7 @@ class TieDPODataset(Dataset):
             "rejected": {"from": "gpt", "value": rejected_text},
         }
 
-        has_image = ("image" in self.list_data_dict[i]) or ("video" in self.list_data_dict[i])
+        has_image = image is not None or ("video" in self.list_data_dict[i])
         win_conv = copy.deepcopy([source["question"], source["chosen"]])
         rej_conv = copy.deepcopy([source["question"], source["rejected"]])
 
@@ -531,7 +650,7 @@ class TieDPODataset(Dataset):
         win_data_dict = dict(
             input_ids=win_data_dict["input_ids"][0],
             labels=win_data_dict["labels"][0],
-            idx=self.list_data_dict[i].get("id", i),
+            idx=self.list_data_dict[i].get("record_id", self.list_data_dict[i].get("id", self.list_data_dict[i].get("sample_id", i))),
         )
 
         if image is not None:
@@ -544,6 +663,8 @@ class TieDPODataset(Dataset):
 
         rej_data_dict["has_image"] = win_data_dict["has_image"] = has_image
         win_data_dict["is_tie"] = is_tie
+        for k, v in self._get_extra_flags(self.list_data_dict[i]).items():
+            rej_data_dict[k] = win_data_dict[k] = v
 
         return rej_data_dict, win_data_dict
 
@@ -590,6 +711,8 @@ class DataCollatorForTieDPODataset(object):
 
         is_tie_list = [inst.get("is_tie", False) for inst in win_instances]
         is_tie = torch.tensor(is_tie_list, dtype=torch.bool)
+        is_ep_tie_list = [inst.get("is_ep_tie", False) for inst in win_instances]
+        is_ep_tie = torch.tensor(is_ep_tie_list, dtype=torch.bool)
 
         batch = dict(
             concatenated_input_ids=concatenated_input_ids,
@@ -607,6 +730,7 @@ class DataCollatorForTieDPODataset(object):
             image_sizes=win_batch["image_sizes"],
             modalities=win_batch["modalities"],
             is_tie=is_tie,
+            is_ep_tie=is_ep_tie,
             idx=win_instances[0].get("idx", 0),
         )
 
@@ -623,8 +747,16 @@ def make_tie_dpo_data_module(tokenizer: transformers.PreTrainedTokenizer, data_a
         data_args=data_args,
     )
     print(f"Train data size is {len(train_dataset)}", flush=True)
+    eval_dataset = None
+    if data_args.eval_data_path:
+        eval_dataset = TieDPODataset(
+            tokenizer=tokenizer,
+            data_path=data_args.eval_data_path,
+            data_args=data_args,
+        )
+        print(f"Eval data size is {len(eval_dataset)}", flush=True)
     data_collator = DataCollatorForTieDPODataset(tokenizer=tokenizer)
-    return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
+    return dict(train_dataset=train_dataset, eval_dataset=eval_dataset, data_collator=data_collator)
 
 
 def get_model(model_args, training_args, bnb_model_from_pretrained_args):
@@ -754,7 +886,7 @@ def train():
         model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=training_args.gradient_checkpointing)
 
     if training_args.lora_enable:
-        from peft import LoraConfig, get_peft_model
+        from peft import LoraConfig, PeftModel, get_peft_model
         lora_config = LoraConfig(
             r=training_args.lora_r,
             lora_alpha=training_args.lora_alpha,
@@ -768,8 +900,16 @@ def train():
                 model.to(torch.bfloat16)
             if training_args.fp16:
                 model.to(torch.float16)
-        rank0_print("Adding LoRA adapters...")
-        model = get_peft_model(model, lora_config)
+        if training_args.lora_weight_path:
+            rank0_print(f"Loading LoRA adapters from {training_args.lora_weight_path}")
+            model = PeftModel.from_pretrained(
+                model,
+                training_args.lora_weight_path,
+                is_trainable=not training_args.eval_only,
+            )
+        else:
+            rank0_print("Adding LoRA adapters...")
+            model = get_peft_model(model, lora_config)
 
     if training_args.gradient_checkpointing:
         if hasattr(model, "enable_input_require_grads"):
@@ -872,39 +1012,73 @@ def train():
         dpo_alpha=training_args.dpo_alpha,
         beta=training_args.beta,
         gamma=training_args.gamma,
+        sft_loss_mode=training_args.sft_loss_mode,
         lambda_tie=training_args.lambda_tie,
         tie_margin=training_args.tie_margin,
         tokenizer=tokenizer,
         max_length=training_args.model_max_length,
+        max_prompt_length=training_args.max_prompt_length,
         generate_during_eval=False,
         precompute_ref_log_probs=training_args.precompute_ref_log_probs,
         **data_module,
     )
     trainer.save_my_lora_ckpt = save_my_lora_ckpt
 
-    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
-        trainer.train(resume_from_checkpoint=True)
+    if training_args.eval_only:
+        metrics = trainer.evaluate()
+        trainer.log_metrics("eval", metrics)
+        trainer.save_metrics("eval", metrics)
+        rank0_print(f"Eval metrics saved to {training_args.output_dir}")
     else:
-        trainer.train()
-    trainer.save_state()
+        # Only resume when Transformers can locate a valid checkpoint directory (checkpoint-<int>).
+        # This avoids crashes when users keep non-standard folders like "checkpoint-53.bad".
+        from transformers.trainer_utils import get_last_checkpoint
 
-    model.config.use_cache = True
+        last_ckpt, trainer_state_path = get_last_resumable_checkpoint(training_args.output_dir)
+        # #region debug-point A:checkpoint-resume
+        safe_emit_debug_event({
+            'runId': 'pre-fix',
+            'hypothesisId': 'A',
+            'location': 'train_tie_dpo.py:get_last_checkpoint',
+            'msg': '[DEBUG] checkpoint resume probe',
+            'data': {
+                'output_dir': training_args.output_dir,
+                'last_ckpt': last_ckpt,
+                'trainer_state_path': trainer_state_path,
+                'trainer_state_exists': (os.path.exists(trainer_state_path) if trainer_state_path else False),
+            },
+        })
+        # #endregion
+        if last_ckpt is not None:
+            trainer.train(resume_from_checkpoint=last_ckpt)
+        else:
+            if trainer_state_path is not None:
+                rank0_print(f"Skip resume because checkpoint is incomplete: {trainer_state_path}")
+            trainer.train()
+        trainer.save_state()
 
-    if training_args.lora_enable:
-        state_dict = get_peft_state_maybe_zero_3(model.named_parameters(), training_args.lora_bias)
-        non_lora_state_dict = get_peft_state_non_lora_maybe_zero_3(model.named_parameters())
-        if training_args.local_rank == 0 or training_args.local_rank == -1:
-            if hasattr(model, "config"):
-                model.config.save_pretrained(training_args.output_dir)
-            if hasattr(model, "generation_config"):
-                model.generation_config.save_pretrained(training_args.output_dir)
-            model.save_pretrained(training_args.output_dir, state_dict=state_dict)
-            torch.save(non_lora_state_dict, os.path.join(training_args.output_dir, "non_lora_trainables.bin"))
-    else:
-        safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
+        model.config.use_cache = True
 
-    rank0_print(f"Model saved to {training_args.output_dir}")
+        if training_args.lora_enable:
+            state_dict = get_peft_state_maybe_zero_3(model.named_parameters(), training_args.lora_bias)
+            non_lora_state_dict = get_peft_state_non_lora_maybe_zero_3(model.named_parameters())
+            if training_args.local_rank == 0 or training_args.local_rank == -1:
+                if hasattr(model, "config"):
+                    model.config.save_pretrained(training_args.output_dir)
+                if hasattr(model, "generation_config"):
+                    model.generation_config.save_pretrained(training_args.output_dir)
+                model.save_pretrained(training_args.output_dir, state_dict=state_dict)
+                torch.save(non_lora_state_dict, os.path.join(training_args.output_dir, "non_lora_trainables.bin"))
+        else:
+            safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
+
+        rank0_print(f"Model saved to {training_args.output_dir}")
+
+
+@record
+def main():
+    train()
 
 
 if __name__ == "__main__":
-    train()
+    main()

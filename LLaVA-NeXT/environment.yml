@@ -1,0 +1,14 @@
+name: tiedpo
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - setuptools
+  - wheel
+  # Common build/runtime deps that help with deepspeed/decord on many Linux setups.
+  - cmake
+  - ninja
+  - ffmpeg
+  - pip:
+      - -r requirements.txt
