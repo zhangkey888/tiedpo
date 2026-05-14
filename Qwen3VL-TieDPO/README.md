@@ -5,6 +5,7 @@ Maintained files in this directory cover only:
 - Qwen3-VL TieDPO training
 - Qwen3-VL A/B-gap evaluation
 - Qwen3-VL lmms-eval benchmark comparison
+- the minimal dataset / trainer / loss implementation needed for the above
 
 ## Required Environment Variables
 
@@ -18,8 +19,9 @@ Optional:
 ```bash
 export CONDA_SH=/path/to/miniconda3/etc/profile.d/conda.sh
 export LMMS_EVAL_DIR=/path/to/lmms-eval
-export HF_ENDPOINT=https://hf-mirror.com
 ```
+
+Keep any private API keys, tokens, or custom endpoints outside the repository and inject them only at runtime.
 
 ## Training
 
@@ -30,7 +32,7 @@ bash scripts/run_qwen3vl_tiedpo_stage1.sh
 
 Important defaults:
 
-- base model: `models/Qwen3-VL-8B-Instruct`
+- base model: set `MODEL_PATH` / `BASE_MODEL` to your local model directory
 - output dir: `workspace/outputs/`
 - train / eval jsonl: `${DATA_ROOT}/processed_splits_balanced_16k_with_evidence/...`
 
@@ -68,3 +70,8 @@ bash scripts/run_qwen3vl_2model_mirb_eval.sh
 - `qwen3vl_tiedpo/loss.py`
 - `qwen3vl_tiedpo/run_tie_dpo.py`
 - `qwen3vl_tiedpo/trainer.py`
+
+## Notes
+
+- Local `workspace/`, model weights, merged checkpoints, and evaluation outputs are ignored by the repo-level `.gitignore`.
+- The shell scripts in `scripts/` are the curated training and evaluation entrypoints kept for open-sourcing.

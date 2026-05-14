@@ -10,8 +10,8 @@ RESULTS_ROOT="${RESULTS_ROOT:-${PROJECT_ROOT}/lmms_eval_results}"
 GROUP_NAME="${GROUP_NAME:-3model_compare_$(date +%Y%m%d-%H%M%S)}"
 
 BASE_MODEL="${BASE_MODEL:-${MODELS_ROOT}/llava-onevision-qwen2-7b-ov}"
-DPO_STRICT_CKPT="${DPO_STRICT_CKPT:-${PROJECT_ROOT}/ckpt/c1-minimal-20260430-012912/c1-minimal-dpo_strict-20260430-012912}"
-TIEDPO_CKPT="${TIEDPO_CKPT:-${PROJECT_ROOT}/ckpt/c1-minimal-20260430-012912/c1-minimal-tie_symmetric-20260430-012912}"
+DPO_STRICT_CKPT="${DPO_STRICT_CKPT:-}"
+TIEDPO_CKPT="${TIEDPO_CKPT:-}"
 
 NUM_PROCESSES="${NUM_PROCESSES:-4}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
@@ -19,14 +19,15 @@ TORCH_DTYPE="${TORCH_DTYPE:-bfloat16}"
 TASKS="${TASKS:-xlrs-lite}"
 MODEL_NAME="${MODEL_NAME:-llava-onevision-qwen2-7b-ov}"
 CONV_TEMPLATE="${CONV_TEMPLATE:-qwen_1_5}"
-HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-0}"
 HF_TOKEN="${HF_TOKEN:-${HUGGING_FACE_HUB_TOKEN:-}}"
 HF_HOME="${HF_HOME:-}"
 HF_HUB_CACHE="${HF_HUB_CACHE:-}"
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
-export HF_ENDPOINT
 export HF_HUB_ENABLE_HF_TRANSFER
+if [[ -n "${HF_ENDPOINT:-}" ]]; then
+    export HF_ENDPOINT
+fi
 if [[ -n "${HF_TOKEN}" ]]; then
     export HF_TOKEN
     export HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}"
@@ -49,14 +50,17 @@ mkdir -p "${GROUP_DIR}"
 echo "LMMS_EVAL_DIR=${LMMS_EVAL_DIR}"
 echo "GROUP_DIR=${GROUP_DIR}"
 echo "TASKS=${TASKS}"
-echo "HF_ENDPOINT=${HF_ENDPOINT}"
-echo "HF_TOKEN_SET=$([[ -n "${HF_TOKEN}" ]] && echo yes || echo no)"
 echo "MODEL_NAME=${MODEL_NAME}"
 echo "CONV_TEMPLATE=${CONV_TEMPLATE}"
 
 if [[ -z "${LMMS_EVAL_DIR}" || ! -d "${LMMS_EVAL_DIR}" ]]; then
     echo "lmms-eval repo not found: ${LMMS_EVAL_DIR}"
   echo "Set LMMS_EVAL_DIR to your local lmms-eval checkout."
+    exit 1
+fi
+
+if [[ -z "${DPO_STRICT_CKPT}" || -z "${TIEDPO_CKPT}" ]]; then
+    echo "Please set DPO_STRICT_CKPT and TIEDPO_CKPT."
     exit 1
 fi
 
@@ -75,7 +79,6 @@ run_lora_model() {
     TASKS="${TASKS}" \
     MODEL_NAME="${MODEL_NAME}" \
     CONV_TEMPLATE="${CONV_TEMPLATE}" \
-    HF_ENDPOINT="${HF_ENDPOINT}" \
     HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER}" \
     bash "${SCRIPT_DIR}/run_lmms_eval_10bench.sh"
 }

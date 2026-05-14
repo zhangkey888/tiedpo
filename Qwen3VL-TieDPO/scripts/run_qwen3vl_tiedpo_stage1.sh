@@ -8,13 +8,15 @@ REPO_ROOT="$(cd "${PROJECT_ROOT}/.." && pwd)"
 DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/data}"
 
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
-export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 export HF_HOME="${HF_HOME:-${REPO_ROOT}/hf_cache}"
 export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-${HF_HOME}/hub}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}/transformers}"
 export TORCHDYNAMO_DISABLE=1
 export TORCH_COMPILE_DISABLE=1
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+if [[ -n "${HF_ENDPOINT:-}" ]]; then
+  export HF_ENDPOINT
+fi
 
 MODEL_PATH="${MODEL_PATH:-${PROJECT_ROOT}/models/Qwen3-VL-8B-Instruct}"
 REF_MODEL_PATH="${REF_MODEL_PATH:-${MODEL_PATH}}"

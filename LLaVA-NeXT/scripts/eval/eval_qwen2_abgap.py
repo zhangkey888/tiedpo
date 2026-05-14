@@ -81,7 +81,6 @@ def import_llava_modules(legacy_root: Path):
     old_endpoint = os.environ.get("HF_ENDPOINT")
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
-    os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
     try:
         import llava.conversation as conversation_lib
     finally:

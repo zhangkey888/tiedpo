@@ -5,6 +5,7 @@ This directory keeps the maintained Qwen2 / LLaVA-OneVision path only:
 - TieDPO training
 - A/B-gap evaluation
 - lmms-eval benchmark comparison
+- custom trainer code used by the maintained recipe
 
 ## Required Environment Variables
 
@@ -19,9 +20,9 @@ Optional:
 ```bash
 export CONDA_SH=/path/to/miniconda3/etc/profile.d/conda.sh
 export LMMS_EVAL_DIR=/path/to/lmms-eval
-export WANDB_API_KEY=...
-export HF_ENDPOINT=https://hf-mirror.com
 ```
+
+Keep private API keys, tokens, and any custom model endpoints in your local shell or CI secret store only.
 
 ## Training
 
@@ -59,3 +60,9 @@ bash scripts/eval/run_3model_lmms_eval_and_summarize.sh
 - `llava/train/train_tie_dpo.py`
 - `llava/train/llava_trainer.py`
 - `trl/trainer/tie_dpo_trainer.py`
+- `data_processing/utils.py`
+
+## Notes
+
+- Local checkpoints, datasets, evaluation outputs, and merged models are ignored by the repo-level `.gitignore`.
+- The kept shell scripts are the maintained training / evaluation entrypoints. Old one-off environment bootstrap scripts were intentionally removed from the curated repo.

@@ -31,13 +31,23 @@ Thumbs.db
 /data/
 /models/
 /hf_cache/
+/outputs/
+/results/
+/checkpoints/
+/artifacts/
 /LLaVA-NeXT/ckpt/
+/LLaVA-NeXT/results/
+/LLaVA-NeXT/outputs/
 /LLaVA-NeXT/eval_abgap/
 /LLaVA-NeXT/lmms_eval_results/
 /LLaVA-NeXT/.dbg/
 /LLaVA-NeXT/data/
+/Qwen3VL-TieDPO/data/
+/Qwen3VL-TieDPO/results/
+/Qwen3VL-TieDPO/outputs/
 /Qwen3VL-TieDPO/models/
 /Qwen3VL-TieDPO/workspace/
+/Qwen3VL-TieDPO/merged/
 
 # Generated artifacts
 wandb/

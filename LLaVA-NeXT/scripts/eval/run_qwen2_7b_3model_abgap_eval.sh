@@ -11,12 +11,11 @@ MODELS_ROOT="${MODELS_ROOT:-${REPO_ROOT}/models}"
 
 CONDA_SH="${CONDA_SH:-}"
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-dpo}"
-HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 HF_HOME="${HF_HOME:-${REPO_ROOT}/hf_cache}"
 
 BASE_MODEL_PATH="${BASE_MODEL_PATH:-${MODELS_ROOT}/llava-onevision-qwen2-7b-ov}"
-DPO_ONLY_CKPT="${DPO_ONLY_CKPT:-${PROJECT_ROOT}/ckpt/c1-minimal-20260430-012912/c1-minimal-dpo_strict-20260430-012912}"
-TIE_SYMMETRIC_CKPT="${TIE_SYMMETRIC_CKPT:-${PROJECT_ROOT}/ckpt/c1-minimal-20260430-012912/c1-minimal-tie_symmetric-20260430-012912}"
+DPO_ONLY_CKPT="${DPO_ONLY_CKPT:-}"
+TIE_SYMMETRIC_CKPT="${TIE_SYMMETRIC_CKPT:-}"
 
 DATASET_VARIANT="${DATASET_VARIANT:-plus200}"
 if [[ "${DATASET_VARIANT}" == "plus200" ]]; then
@@ -53,6 +52,11 @@ if [[ ! -f "${EVAL_PY}" || ! -f "${SUMMARY_SCRIPT}" ]]; then
   exit 1
 fi
 
+if [[ -z "${DPO_ONLY_CKPT}" || -z "${TIE_SYMMETRIC_CKPT}" ]]; then
+  echo "Please set DPO_ONLY_CKPT and TIE_SYMMETRIC_CKPT."
+  exit 1
+fi
+
 if [[ ! -d "${BASE_MODEL_PATH}" || ! -d "${DPO_ONLY_CKPT}" || ! -d "${TIE_SYMMETRIC_CKPT}" ]]; then
   echo "missing model path"
   echo "BASE_MODEL_PATH=${BASE_MODEL_PATH}"
@@ -84,9 +88,11 @@ echo "Activated conda env: ${CONDA_ENV_NAME}"
 
 export PYTHONNOUSERSITE=1
 export CUDA_VISIBLE_DEVICES="${EVAL_CUDA_VISIBLE_DEVICES}"
-export HF_ENDPOINT
 export HF_HOME
 export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-${HF_HOME}/hub}"
+if [[ -n "${HF_ENDPOINT:-}" ]]; then
+  export HF_ENDPOINT
+fi
 echo "Using CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 
 run_eval() {

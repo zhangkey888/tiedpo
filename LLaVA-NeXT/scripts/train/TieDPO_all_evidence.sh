@@ -12,9 +12,7 @@ export TORCH_COMPILE_DISABLE=1
 export WANDB_MODE="${WANDB_MODE:-online}"
 export PYTHONNOUSERSITE=1
 export PYTHONPATH="${PROJECT_ROOT}:$PYTHONPATH"
-export WANDB_API_KEY="${WANDB_API_KEY:-}"
 echo "pythonpath="$PYTHONPATH
-export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 export HF_HOME="${HF_HOME:-${REPO_ROOT}/hf_cache}"
 export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-${HF_HOME}/hub}"
 export OMP_NUM_THREADS=8
@@ -22,6 +20,9 @@ export NCCL_IB_DISABLE=0
 export NCCL_IB_GID_INDEX=3
 export NCCL_SOCKET_IFNAME=eth0
 export NCCL_DEBUG=INFO
+if [[ -n "${HF_ENDPOINT:-}" ]]; then
+    export HF_ENDPOINT
+fi
 VISION_MODEL_VERSION="google/siglip-so400m-patch14-384"
 VISION_MODEL_VERSION_CLEAN="${VISION_MODEL_VERSION//\///_}"
 

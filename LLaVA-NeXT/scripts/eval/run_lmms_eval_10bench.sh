@@ -18,14 +18,15 @@ TASKS="${TASKS:-xlrs-lite}"
 TORCH_DTYPE="${TORCH_DTYPE:-bfloat16}"
 MODEL_NAME="${MODEL_NAME:-llava-onevision-qwen2-7b-ov}"
 CONV_TEMPLATE="${CONV_TEMPLATE:-qwen_1_5}"
-HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-0}"
 HF_TOKEN="${HF_TOKEN:-${HUGGING_FACE_HUB_TOKEN:-}}"
 HF_HOME="${HF_HOME:-}"
 HF_HUB_CACHE="${HF_HUB_CACHE:-}"
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
-export HF_ENDPOINT
 export HF_HUB_ENABLE_HF_TRANSFER
+if [[ -n "${HF_ENDPOINT:-}" ]]; then
+    export HF_ENDPOINT
+fi
 if [[ -n "${HF_TOKEN}" ]]; then
     export HF_TOKEN
     export HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}"
@@ -64,8 +65,6 @@ echo "lora_ckpt=${LORA_CKPT}"
 echo "merged_model_dir=${MERGED_MODEL_DIR}"
 echo "results_dir=${RESULTS_DIR}/${RUN_NAME}"
 echo "tasks=${TASKS}"
-echo "hf_endpoint=${HF_ENDPOINT}"
-echo "hf_token_set=$([[ -n "${HF_TOKEN}" ]] && echo yes || echo no)"
 echo "model_name=${MODEL_NAME}"
 echo "conv_template=${CONV_TEMPLATE}"
 

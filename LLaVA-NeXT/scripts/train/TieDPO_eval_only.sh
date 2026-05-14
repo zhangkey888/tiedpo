@@ -13,10 +13,12 @@ export WANDB_MODE="${WANDB_MODE:-online}"
 export PYTHONNOUSERSITE=1
 export PYTHONPATH="${PROJECT_ROOT}:$PYTHONPATH"
 echo "pythonpath="$PYTHONPATH
-export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 export HF_HOME="${HF_HOME:-${REPO_ROOT}/hf_cache}"
 export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-${HF_HOME}/hub}"
 export OMP_NUM_THREADS=8
+if [[ -n "${HF_ENDPOINT:-}" ]]; then
+    export HF_ENDPOINT
+fi
 
 VISION_MODEL_VERSION="google/siglip-so400m-patch14-384"
 export WANDB_PROJECT=llava-TieDPO
