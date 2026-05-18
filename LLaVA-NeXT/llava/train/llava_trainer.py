@@ -1,7 +1,10 @@
 import os
+import json
 import torch
 import torch.nn as nn
 import datetime
+import inspect
+import urllib.request
 
 from accelerate import Accelerator
 from accelerate.utils import InitProcessGroupKwargs, GradientAccumulationPlugin
@@ -29,6 +32,45 @@ if is_datasets_available():
     import datasets
 
 from llava.utils import rank0_print
+
+
+def _emit_nccl_debug_event(run_id: str, hypothesis_id: str, location: str, msg: str, data=None):
+    # #region debug-point B:save-hook
+    _p = ".dbg/nccl-collective-timeout.env"
+    _u, _s = "http://127.0.0.1:7777/event", "nccl-collective-timeout"
+    try:
+        with open(_p) as f:
+            c = f.read()
+        _u = next((l.split("=", 1)[1] for l in c.split("\n") if l.startswith("DEBUG_SERVER_URL=")), _u)
+        _s = next((l.split("=", 1)[1] for l in c.split("\n") if l.startswith("DEBUG_SESSION_ID=")), _s)
+        urllib.request.urlopen(
+            urllib.request.Request(
+                _u,
+                data=json.dumps(
+                    {
+                        "sessionId": _s,
+                        "runId": run_id,
+                        "hypothesisId": hypothesis_id,
+                        "location": location,
+                        "msg": msg,
+                        "data": data or {},
+                    }
+                ).encode(),
+                headers={"Content-Type": "application/json"},
+            ),
+            timeout=0.2,
+        ).read()
+    except Exception:
+        pass
+    # #endregion
+
+
+def _call_parent_save_checkpoint(parent_cls, trainer_self, model, trial, metrics=None):
+    parent_save = super(parent_cls, trainer_self)._save_checkpoint
+    params = inspect.signature(parent_save).parameters
+    if "metrics" in params:
+        return parent_save(model, trial, metrics)
+    return parent_save(model, trial)
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -377,6 +419,19 @@ class LLaVATrainer(Trainer):
         return self.optimizer
 
     def _save_checkpoint(self, model, trial, metrics=None):
+        _emit_nccl_debug_event(
+            "pre-fix",
+            "B",
+            "llava_trainer.py:LLaVATieDPOTrainer._save_checkpoint:enter",
+            "[DEBUG] enter _save_checkpoint",
+            {
+                "rank": getattr(self.args, "local_rank", -1),
+                "global_step": getattr(self.state, "global_step", -1),
+                "lora_enable": bool(getattr(self.args, "lora_enable", False)),
+                "tune_mm_mlp_adapter": bool(getattr(self.args, "tune_mm_mlp_adapter", False)),
+                "has_metrics": metrics is not None,
+            },
+        )
         if getattr(self.args, "tune_mm_mlp_adapter", False) or (
             hasattr(self.args, "mm_tunable_parts") and (len(self.args.mm_tunable_parts.split(",")) == 1 and ("mm_mlp_adapter" in self.args.mm_tunable_parts or "mm_vision_resampler" in self.args.mm_tunable_parts))
         ):
@@ -397,7 +452,7 @@ class LLaVATrainer(Trainer):
                 self.model.config.save_pretrained(output_dir)
                 torch.save(weight_to_save, os.path.join(output_dir, f"mm_projector.bin"))
         else:
-            super(LLaVATrainer, self)._save_checkpoint(model, trial, metrics)
+            _call_parent_save_checkpoint(LLaVATrainer, self, model, trial, metrics)
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         if getattr(self.args, "tune_mm_mlp_adapter", False):
@@ -454,7 +509,7 @@ class LLaVADPOTrainer(DPOTrainer):
                 unwrapped_model = unwrap_model(model)
                 self.save_my_lora_ckpt(output_dir, self.args, unwrapped_model)
             else:
-                super(LLaVADPOTrainer, self)._save_checkpoint(model, trial, metrics)
+                _call_parent_save_checkpoint(LLaVADPOTrainer, self, model, trial, metrics)
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         if getattr(self.args, "tune_mm_mlp_adapter", False):
@@ -510,7 +565,7 @@ class LLaVADPOTrainer_Vision(VDPOTrainer):
                 unwrapped_model = unwrap_model(model)
                 self.save_my_lora_ckpt(output_dir, self.args, unwrapped_model)
             else:
-                super(LLaVADPOTrainer_Vision, self)._save_checkpoint(model, trial, metrics)
+                _call_parent_save_checkpoint(LLaVADPOTrainer_Vision, self, model, trial, metrics)
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         if getattr(self.args, "tune_mm_mlp_adapter", False):
@@ -567,7 +622,7 @@ class LLaVADPOTrainer_SVCO(SVCOTrainer):
                 unwrapped_model = unwrap_model(model)
                 self.save_my_lora_ckpt(output_dir, self.args, unwrapped_model)
             else:
-                super(LLaVADPOTrainer_SVCO, self)._save_checkpoint(model, trial, metrics)
+                _call_parent_save_checkpoint(LLaVADPOTrainer_SVCO, self, model, trial, metrics)
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         if getattr(self.args, "tune_mm_mlp_adapter", False):
@@ -626,7 +681,7 @@ class LLaVATieDPOTrainer(TieDPOTrainer):
                 unwrapped_model = unwrap_model(model)
                 self.save_my_lora_ckpt(output_dir, self.args, unwrapped_model)
             else:
-                super(LLaVATieDPOTrainer, self)._save_checkpoint(model, trial, metrics)
+                _call_parent_save_checkpoint(LLaVATieDPOTrainer, self, model, trial, metrics)
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         if getattr(self.args, "tune_mm_mlp_adapter", False):

@@ -1,29 +1,111 @@
-# TieDPO: Tie-Aware Direct Preference Optimization for Multimodal LLMs
+# TieDPO
 
-TieDPO extends DPO to handle **tie** annotations in preference data, where two responses are of equal quality. Standard DPO treats all pairs as strict preferences, which can mislead training when the two responses are actually comparable. TieDPO introduces a tie regularization loss that penalizes the model for assigning large reward margins to tied pairs.
+This repository is a cleaned, GitHub-friendly snapshot of the maintained TieDPO codepaths only.
 
-Built on top of [LLaVA-NeXT](https://github.com/LLaVA-VL/LLaVA-NeXT) with [LLaVA-OneVision-Qwen2-7B](https://huggingface.co/lmms-lab/llava-onevision-qwen2-7b-ov) as the base model.
+- `LLaVA-NeXT/`: Qwen2 / LLaVA-OneVision TieDPO training, evaluation, and lmms-eval comparison
+- `Qwen3VL-TieDPO/`: Qwen3-VL TieDPO training, evaluation, and lmms-eval comparison
 
-## Method
+Large local assets such as models, datasets, checkpoints, caches, merged weights, and evaluation outputs are intentionally ignored by `.gitignore`.
 
-The training objective combines three terms:
+## Repository Scope
 
+The curated repo keeps the parts that are useful for reproduction and inspection:
+
+- training entrypoints and trainer implementations
+- dataset loading / lightweight data construction helpers
+- evaluation scripts for A/B-gap and lmms-eval
+- minimal configs needed to run training or evaluation
+
+It intentionally excludes local data, model weights, caches, and one-off environment bootstrap scripts.
+
+## Layout
+
+```text
+tiedpo/
+├── LLaVA-NeXT/
+│   ├── data_processing/          # json/jsonl helpers used by training
+│   ├── llava/train/              # Qwen2 / LLaVA-OneVision TieDPO training code
+│   ├── trl/trainer/              # custom TieDPO trainer variants
+│   └── scripts/                  # maintained train/eval entrypoints
+├── Qwen3VL-TieDPO/
+│   ├── qwen3vl_tiedpo/           # dataset, loss, trainer, run entrypoint
+│   ├── configs/                  # FSDP / DeepSpeed configs
+│   └── scripts/                  # maintained train/eval entrypoints
+└── .gitignore                    # ignores local assets and generated results
 ```
-L = alpha * L_DPO + lambda_tie * L_tie + L_SFT
+
+## Required Environment Variables
+
+Set these before running the shell entrypoints:
+
+```bash
+export DATA_ROOT=/path/to/data_root
+export MODELS_ROOT=/path/to/models_root
+export HF_HOME=/path/to/hf_cache
 ```
 
-- **L_DPO**: standard DPO loss on strict (non-tie) pairs
-- **L_tie**: tie regularization — penalizes large reward margins on tied pairs
-- **L_SFT**: SFT loss on the chosen response
+Optional:
 
-For tied pairs, the tie loss is:
+```bash
+export LMMS_EVAL_DIR=/path/to/lmms-eval
+export CONDA_SH=/path/to/miniconda3/etc/profile.d/conda.sh
 ```
-L_tie = clamp(|reward_margin| - tie_margin, min=0)^2
+
+Private API keys, access tokens, or custom model endpoints should be set only in your local shell or CI secrets, not committed to the repository.
+
+## Maintained Entrypoints
+
+### Qwen2 / LLaVA-OneVision
+
+Train the maintained three-run recipe:
+
+```bash
+cd LLaVA-NeXT
+bash scripts/train/run_lora_c1_minimal.sh
+```
+
+Run A/B-gap evaluation:
+
+```bash
+cd LLaVA-NeXT
+bash scripts/eval/run_qwen2_7b_3model_abgap_eval.sh
+```
+
+Run lmms-eval benchmark comparison:
+
+```bash
+cd LLaVA-NeXT
+LMMS_EVAL_DIR=/path/to/lmms-eval \
+bash scripts/eval/run_3model_lmms_eval_and_summarize.sh
+```
+
+### Qwen3-VL
+
+Train the maintained TieDPO recipe:
+
+```bash
+cd Qwen3VL-TieDPO
+bash scripts/run_qwen3vl_tiedpo_stage1.sh
+```
+
+Run A/B-gap evaluation:
+
+```bash
+cd Qwen3VL-TieDPO
+bash scripts/run_qwen3vl_base_and_tiebench_eval.sh
+```
+
+Run lmms-eval benchmark comparison:
+
+```bash
+cd Qwen3VL-TieDPO
+LMMS_EVAL_DIR=/path/to/lmms-eval \
+bash scripts/run_qwen3vl_2model_mirb_eval.sh
 ```
 
 ## Data Format
 
-Training data is a JSON array. Each sample must contain:
+Example sample:
 
 ```json
 {
@@ -35,68 +117,4 @@ Training data is a JSON array. Each sample must contain:
 }
 ```
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `prompt` | string | User question |
-| `chosen` | string | Preferred (or tied) response |
-| `rejected` | string | Rejected (or tied) response |
-| `is_tie` | bool | `true` if the two responses are of equal quality |
-| `images` | list[str] | Paths relative to `--image_folder` |
-
-A sample data file is provided at `data/sample.json`.
-
-## Environment Setup
-
-Requires Python 3.11 and CUDA. Tested on 8x A100/H100 GPUs.
-
-```bash
-conda create -n tiedpo python=3.11 -y
-conda activate tiedpo
-bash setup_env.sh
-```
-
-`setup_env.sh` installs all dependencies from `requirements.txt` and patches the local `trl/trainer/` files into the installed trl package.
-
-## Training
-
-Edit `scripts/train/TieDPO.sh` to set your paths:
-
-```bash
-SFT_MODEL="/path/to/llava-onevision-qwen2-7b-ov"   # base model
-DATA_PATH="/path/to/tie_dpo_train.json"              # training data
-IMAGE_FOLDER="/path/to/images/"                      # image root directory
-```
-
-Then run:
-
-```bash
-cd LLaVA-NeXT
-bash scripts/train/TieDPO.sh
-```
-
-Key hyperparameters:
-
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `--beta` | 0.1 | DPO temperature |
-| `--lambda_tie` | 1.0 | Weight of tie regularization loss |
-| `--tie_margin` | 0.0 | Margin threshold for tie loss |
-| `--dpo_alpha` | 1.0 | Weight of DPO loss |
-| `--lora_r` | 128 | LoRA rank |
-| `--lora_alpha` | 256 | LoRA alpha |
-
-## Key Changes vs LLaVA-NeXT
-
-- `trl/trainer/tie_dpo_trainer.py`: TieDPOTrainer with tie-aware loss
-- `llava/train/train_tie_dpo.py`: training entry point
-- `llava/train/llava_trainer.py`: LLaVATieDPOTrainer wrapping TieDPOTrainer
-
-## Requirements
-
-See `requirements.txt`. Core dependencies:
-
-- PyTorch 2.8.0
-- Transformers 4.57.6
-- PEFT 0.18.1
-- DeepSpeed 0.18.8
-- Accelerate 1.12.0
+`images` are interpreted relative to `DATA_ROOT` unless the jsonl stores absolute paths.

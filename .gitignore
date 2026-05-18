@@ -1,0 +1,69 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+
+# Virtual env / local env
+.env
+*.env
+.venv/
+venv/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Notebooks
+.ipynb_checkpoints/
+*.ipynb
+
+# Large local assets: models, caches, datasets
+/data/
+/models/
+/hf_cache/
+/outputs/
+/results/
+/checkpoints/
+/artifacts/
+/LLaVA-NeXT/ckpt/
+/LLaVA-NeXT/results/
+/LLaVA-NeXT/outputs/
+/LLaVA-NeXT/eval_abgap/
+/LLaVA-NeXT/lmms_eval_results/
+/LLaVA-NeXT/.dbg/
+/LLaVA-NeXT/data/
+/Qwen3VL-TieDPO/data/
+/Qwen3VL-TieDPO/results/
+/Qwen3VL-TieDPO/outputs/
+/Qwen3VL-TieDPO/models/
+/Qwen3VL-TieDPO/workspace/
+/Qwen3VL-TieDPO/merged/
+
+# Generated artifacts
+wandb/
+runs/
+logs/
+*.log
+*.out
+*.err
+
+# Common model/data file types outside ignored directories
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+
+# Keep tiny examples
+!/LLaVA-NeXT/data/
+!/LLaVA-NeXT/data/sample.json
